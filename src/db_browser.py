@@ -118,6 +118,13 @@ class DbBrowser(Gtk.Box):
             GObject.SignalFlags.RUN_FIRST, None,
             (GObject.TYPE_PYOBJECT,),  # conn
         ),
+        'proxy-not-found': (
+            GObject.SignalFlags.RUN_FIRST, None,
+            (str,),  # binary name, e.g. 'cloud-sql-proxy'
+        ),
+        'connection-failed': (
+            GObject.SignalFlags.RUN_FIRST, None, (),
+        ),
     }
 
     def __init__(self):
@@ -215,6 +222,7 @@ class DbBrowser(Gtk.Box):
         self._conn_error_label.add_css_class('caption')
         self._conn_error_label.add_css_class('error')
         self._conn_error_label.set_xalign(0)
+        self._conn_error_label.set_selectable(True)
         self._conn_error_label.set_wrap(True)
         self._conn_error_label.set_hexpand(True)
         self._conn_error_bar.append(self._conn_error_label)
@@ -456,11 +464,14 @@ class DbBrowser(Gtk.Box):
     def _expand_favourites(self):
         """Expand the Favourites group row in the tree."""
         it = self._store.get_iter_first()
-        if it and self._store.get_value(it, COL_TYPE) == 'favourites':
-            path = self._store.get_path(it)
-            fpath = self._filter.convert_child_path_to_path(path)
-            if fpath:
-                self._tree.expand_row(fpath, False)
+        while it:
+            if self._store.get_value(it, COL_TYPE) == 'favourites':
+                path = self._store.get_path(it)
+                fpath = self._filter.convert_child_path_to_path(path)
+                if fpath:
+                    self._tree.expand_row(fpath, False)
+                return
+            it = self._store.iter_next(it)
 
     def _on_db_selected(self, dropdown, _param):
         if self._db_switch_inhibit:
@@ -509,7 +520,7 @@ class DbBrowser(Gtk.Box):
         """Call before load() after a schema rename so expansion state is preserved."""
         self._rename_hint = (old_schema, new_schema)
 
-    def load(self, conn):
+    def load(self, conn, initial_connect=False):
         self._load_gen += 1
         gen = self._load_gen
         self._last_conn = conn
@@ -536,9 +547,9 @@ class DbBrowser(Gtk.Box):
         self._store.append(None, [
             'content-loading-symbolic', 'Loading…', 'loading', conn, '', ''
         ])
-        threading.Thread(target=self._fetch_schema, args=(conn, gen), daemon=True).start()
+        threading.Thread(target=self._fetch_schema, args=(conn, gen, initial_connect), daemon=True).start()
 
-    def _fetch_schema(self, conn, gen):
+    def _fetch_schema(self, conn, gen, initial_connect=False):
         try:
             import psycopg
             from tunnel import open_db
@@ -718,7 +729,12 @@ class DbBrowser(Gtk.Box):
                           schema_warning, schemas_hidden, current_role_attrs, roles_list, gen)
 
         except Exception as e:
-            GLib.idle_add(self._show_error, _friendly_pg_error(e), gen)
+            from tunnel import ProxyNotFoundError
+            if isinstance(e, ProxyNotFoundError):
+                GLib.idle_add(self.emit, 'proxy-not-found', e.binary)
+                GLib.idle_add(self._show_error, str(e), gen, initial_connect)
+            else:
+                GLib.idle_add(self._show_error, _friendly_pg_error(e), gen, initial_connect)
 
     def _populate(self, conn, schema_items, all_databases,
                   schema_warning, schemas_hidden, current_role_attrs, roles_list, gen):
@@ -806,7 +822,7 @@ class DbBrowser(Gtk.Box):
             fav_it = self._store.append(None, [
                 'starred-symbolic', 'Favourites', 'favourites', conn, '', ''
             ])
-            for fav in pinned:
+            for fav in sorted(pinned, key=lambda f: (f['table'].lower(), f['schema'].lower())):
                 label = f'{fav["table"]} ({fav["schema"]})'
                 self._store.append(fav_it, [
                     'x-office-spreadsheet-symbolic', label, 'favourite',
@@ -946,7 +962,7 @@ class DbBrowser(Gtk.Box):
         if pinned:
             self._expand_favourites()
 
-    def _show_error(self, error_msg, gen):
+    def _show_error(self, error_msg, gen, initial_connect=False):
         if gen != self._load_gen:
             return
         self._loading_spinner.stop()
@@ -956,6 +972,8 @@ class DbBrowser(Gtk.Box):
         self._search_bar.set_visible(False)
         self._conn_error_label.set_label(error_msg)
         self._conn_error_bar.set_visible(True)
+        if initial_connect:
+            self.emit('connection-failed')
 
     def get_loaded_schemas(self):
         """Return list of schema names currently loaded in the tree."""
@@ -1262,13 +1280,62 @@ class DbBrowser(Gtk.Box):
         if not conn:
             return
         self._favs.add(conn.get('id', ''), schema, table, item_type)
-        self.load(conn)
+        self._refresh_favourites_in_tree(conn)
 
     def _do_unpin(self, conn, schema, table):
         if not conn:
             return
         self._favs.remove(conn.get('id', ''), schema, table)
-        self.load(conn)
+        self._refresh_favourites_in_tree(conn)
+
+    def _refresh_favourites_in_tree(self, conn):
+        """Surgically update only the Favourites section without reloading the entire tree."""
+        conn_id = conn.get('id', '')
+        pinned = self._favs.get(conn_id)
+
+        # Find existing 'favourites' parent row in the store
+        fav_it = None
+        it = self._store.get_iter_first()
+        while it:
+            if self._store.get_value(it, COL_TYPE) == 'favourites':
+                fav_it = it
+                break
+            it = self._store.iter_next(it)
+
+        if not pinned:
+            if fav_it:
+                self._store.remove(fav_it)
+            return
+
+        if fav_it:
+            # Clear all existing children and repopulate
+            child = self._store.iter_children(fav_it)
+            while child:
+                self._store.remove(child)
+                child = self._store.iter_children(fav_it)
+        else:
+            # Insert favourites after Server Activity (index 1) to match load() ordering.
+            # Fall back to index 0 if the activity row isn't present yet.
+            insert_pos = 0
+            it = self._store.get_iter_first()
+            if it and self._store.get_value(it, COL_TYPE) == 'activity':
+                insert_pos = 1
+            fav_it = self._store.insert(None, insert_pos, [
+                'starred-symbolic', 'Favourites', 'favourites', conn, '', ''
+            ])
+
+        for fav in sorted(pinned, key=lambda f: (f['table'].lower(), f['schema'].lower())):
+            label = f'{fav["table"]} ({fav["schema"]})'
+            self._store.append(fav_it, [
+                'x-office-spreadsheet-symbolic', label, 'favourite',
+                conn, fav['schema'], fav['table'],
+            ])
+
+        # Ensure the favourites section stays expanded
+        fav_path = self._store.get_path(fav_it)
+        filter_path = self._filter.convert_child_path_to_path(fav_path)
+        if filter_path:
+            self._tree.expand_row(filter_path, False)
 
     def _on_row_activated(self, tree, path, _col):
         it = self._filter.get_iter(path)

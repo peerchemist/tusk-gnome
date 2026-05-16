@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import uuid
@@ -9,6 +10,24 @@ CONNECTIONS_FILE = os.path.join(CONFIG_DIR, 'connections.json')
 FAVOURITES_FILE = os.path.join(CONFIG_DIR, 'favourites.json')
 KEYRING_SERVICE = 'xyz.shapemachine.tusk-gnome'
 
+SCHEMA_VERSION = 2
+
+_NEW_FIELD_DEFAULTS = {
+    'tags': list,
+    'last_connected': None,
+    'ssl_mode': 'prefer',
+    'ssl_root_cert': None,
+    'cloud_provider': None,
+    'cloud_region': None,
+    'cloud_auth_mode': 'password',
+    'cloud_instance_id': None,
+    'cloud_proxy_enabled': False,
+    'cloud_proxy_port': None,
+    'secondary_endpoint': None,
+    'secondary_port': None,
+    'active_endpoint': 'primary',
+}
+
 
 class KeyringUnavailableError(Exception):
     pass
@@ -18,22 +37,118 @@ def _ssh_key(conn_id):
     return f'{conn_id}:ssh'
 
 
+_RUNTIME_ONLY_FIELDS = {'active_endpoint'}
+
+
+def _write_connections_file(connections, tags_registry):
+    tmp = CONNECTIONS_FILE + '.tmp'
+    # Strip runtime-only fields before persisting
+    serialisable = [
+        {k: v for k, v in c.items() if k not in _RUNTIME_ONLY_FIELDS}
+        for c in connections
+    ]
+    with open(tmp, 'w') as f:
+        json.dump(
+            {
+                'schema_version': SCHEMA_VERSION,
+                'connections': serialisable,
+                'tags': tags_registry,
+            },
+            f,
+            indent=2,
+        )
+    os.replace(tmp, CONNECTIONS_FILE)
+
+
+def _apply_defaults(conn, tags_registry):
+    """Add any missing new fields to a connection dict in-place."""
+    if 'id' not in conn:
+        conn['id'] = str(uuid.uuid4())
+    for field, default in _NEW_FIELD_DEFAULTS.items():
+        if field not in conn:
+            conn[field] = default() if callable(default) else default
+    # Convert legacy folder field to a tag
+    if 'folder' in conn:
+        folder = conn.pop('folder')
+        if folder:
+            tags_registry.setdefault(folder, {'color': '#aaaaaa', 'warn_on_connect': False})
+            if folder not in conn['tags']:
+                conn['tags'].append(folder)
+    # Convert legacy environment/environment_color fields to a tag
+    if 'environment' in conn:
+        env = conn.pop('environment')
+        color = conn.pop('environment_color', '#aaaaaa') or '#aaaaaa'
+        if env:
+            tags_registry.setdefault(env, {'color': color, 'warn_on_connect': False})
+            if env not in conn['tags']:
+                conn['tags'].append(env)
+    elif 'environment_color' in conn:
+        conn.pop('environment_color')
+
+
 class ConnectionStore:
     def __init__(self):
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        self._connections = self._load()
+        self._connections, self._tags_registry = self._load()
 
     def _load(self):
-        if os.path.exists(CONNECTIONS_FILE):
-            with open(CONNECTIONS_FILE) as f:
-                return json.load(f)
-        return []
+        if not os.path.exists(CONNECTIONS_FILE):
+            return [], {}
+        with open(CONNECTIONS_FILE) as f:
+            raw = json.load(f)
+        if isinstance(raw, list):
+            # v1 format — bare array; migrate in-place and save
+            return self._migrate_v1(raw)
+        # v2+ format
+        connections = raw.get('connections', [])
+        tags_registry = raw.get('tags', {})
+        # Still apply defaults in case new fields were added since last write
+        for conn in connections:
+            _apply_defaults(conn, tags_registry)
+        return connections, tags_registry
+
+    def _migrate_v1(self, old_list):
+        tags_registry = {}
+        for conn in old_list:
+            _apply_defaults(conn, tags_registry)
+        _write_connections_file(old_list, tags_registry)
+        return old_list, tags_registry
 
     def _save(self):
-        tmp = CONNECTIONS_FILE + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(self._connections, f, indent=2)
-        os.replace(tmp, CONNECTIONS_FILE)
+        _write_connections_file(self._connections, self._tags_registry)
+
+    def get_tags_registry(self):
+        return dict(self._tags_registry)
+
+    def set_tag(self, name, color, warn_on_connect):
+        self._tags_registry[name] = {'color': color, 'warn_on_connect': warn_on_connect}
+        self._save()
+
+    def remove_tag(self, name):
+        self._tags_registry.pop(name, None)
+        self._save()
+
+    def rename_tag(self, old_name, new_name, *, _defer_save=False):
+        """Rename a tag and cascade the change to all connections.
+
+        Pass _defer_save=True when a subsequent store call (e.g. set_tag) will
+        write the file, to avoid a redundant intermediate save.
+        """
+        if old_name not in self._tags_registry or old_name == new_name:
+            return
+        if new_name in self._tags_registry:
+            return
+        meta = self._tags_registry.pop(old_name)
+        self._tags_registry[new_name] = meta
+        for i, c in enumerate(self._connections):
+            tags = c.get('tags', [])
+            if old_name in tags:
+                self._connections[i] = {
+                    **c,
+                    'tags': [new_name if t == old_name else t for t in tags],
+                }
+        if not _defer_save:
+            self._save()
 
     def list(self):
         return list(self._connections)
@@ -51,8 +166,7 @@ class ConnectionStore:
             raise KeyringUnavailableError(str(e)) from e
 
     def add(self, conn):
-        if 'id' not in conn:
-            conn['id'] = str(uuid.uuid4())
+        _apply_defaults(conn, self._tags_registry)
         password = conn.pop('password', '')
         ssh_passphrase = conn.pop('ssh_passphrase', '')
         try:
@@ -66,8 +180,7 @@ class ConnectionStore:
 
     def add_after(self, after_id, conn):
         """Like add(), but inserts the new connection immediately after after_id."""
-        if 'id' not in conn:
-            conn['id'] = str(uuid.uuid4())
+        _apply_defaults(conn, self._tags_registry)
         password = conn.pop('password', '')
         ssh_passphrase = conn.pop('ssh_passphrase', '')
         try:
@@ -111,9 +224,92 @@ class ConnectionStore:
             raise KeyringUnavailableError(str(e)) from e
         for i, c in enumerate(self._connections):
             if c['id'] == conn['id']:
-                self._connections[i] = conn
+                merged = {**c, **conn}
+                _apply_defaults(merged, self._tags_registry)
+                self._connections[i] = merged
+                conn = merged
                 break
         self._save()
+        return conn
+
+    def remove_tag_from_connections(self, tag_name):
+        """Remove a tag from all connections in a single save."""
+        for i, c in enumerate(self._connections):
+            if tag_name in c.get('tags', []):
+                updated = {**c, 'tags': [t for t in c['tags'] if t != tag_name]}
+                self._connections[i] = updated
+        self._save()
+
+    def export_json(self, include_passwords=False):
+        """Return a JSON-serialisable dict of all connections and the tags registry.
+
+        Raises KeyringUnavailableError if include_passwords=True and any keyring
+        lookup fails, so callers can surface the error to the user.
+        """
+        conns = []
+        for c in self._connections:
+            entry = dict(c)
+            if include_passwords:
+                try:
+                    pwd = keyring.get_password(KEYRING_SERVICE, c['id']) or ''
+                    if pwd:
+                        entry['password'] = pwd
+                except Exception as e:
+                    raise KeyringUnavailableError(str(e)) from e
+                try:
+                    ssh_pp = keyring.get_password(KEYRING_SERVICE, _ssh_key(c['id'])) or ''
+                    if ssh_pp:
+                        entry['ssh_passphrase'] = ssh_pp
+                except Exception as e:
+                    raise KeyringUnavailableError(str(e)) from e
+            conns.append(entry)
+        return {
+            'schema_version': SCHEMA_VERSION,
+            'exported_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+            'tags_registry': dict(self._tags_registry),
+            'connections': conns,
+        }
+
+    def bulk_import(self, conns, tags_registry=None):
+        """Import a list of connection dicts, skipping any whose id already exists.
+
+        Name collisions are resolved by appending ' (imported)' to the incoming name.
+        Returns (added, skipped) counts.
+        """
+        if tags_registry:
+            for name, meta in tags_registry.items():
+                self._tags_registry.setdefault(name, meta)
+        existing_ids = {c['id'] for c in self._connections}
+        existing_names = {c['name'] for c in self._connections}
+        added = 0
+        skipped = 0
+        required = ('name', 'host', 'port', 'database', 'username')
+        for conn in conns:
+            if any(not conn.get(f) for f in required):
+                skipped += 1
+                continue
+            if conn.get('id') in existing_ids:
+                skipped += 1
+                continue
+            conn = dict(conn)
+            conn['id'] = conn.get('id') or str(uuid.uuid4())
+            if conn.get('name', '') in existing_names:
+                conn['name'] = conn['name'] + ' (imported)'
+            pwd = conn.pop('password', '')
+            ssh_pp = conn.pop('ssh_passphrase', '')
+            _apply_defaults(conn, self._tags_registry)
+            try:
+                keyring.set_password(KEYRING_SERVICE, conn['id'], pwd)
+                keyring.set_password(KEYRING_SERVICE, _ssh_key(conn['id']), ssh_pp)
+            except Exception:
+                pass
+            self._connections.append(conn)
+            existing_ids.add(conn['id'])
+            existing_names.add(conn['name'])
+            added += 1
+        if added > 0 or tags_registry:
+            self._save()
+        return added, skipped
 
 
 class FavouritesStore:

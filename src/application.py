@@ -21,10 +21,13 @@ class TuskApplication(Adw.Application):
         self.set_accels_for_action('app.preferences',     ['<Control>comma'])
         self.set_accels_for_action('app.quit',            ['<Control>q'])
         self.set_accels_for_action('win.quick-open',      ['<Control>p'])
+        self.set_accels_for_action('win.new-sql-file',    ['<Control>n'])
+        self.set_accels_for_action('win.new-folder',      ['<Control><Shift>n'])
         self.set_accels_for_action('win.close-tab',       ['<Control>w'])
         self.set_accels_for_action('win.next-tab',        ['<Control>Tab'])
         self.set_accels_for_action('win.prev-tab',        ['<Control><Shift>Tab'])
-        self.set_accels_for_action('win.refresh-tab',     ['<Control>r'])
+        self.set_accels_for_action('win.refresh-tab',            ['<Control>r'])
+        self.set_accels_for_action('win.show-connection-manager', ['<Control>Home'])
         for i in range(1, 10):
             self.set_accels_for_action(f'win.goto-tab-{i}', [f'<Alt>{i}'])
 

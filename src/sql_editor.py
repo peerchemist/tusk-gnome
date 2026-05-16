@@ -14,6 +14,7 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GObject, GLib, Gdk, Gio
 
 from data_grid import make_column_view
+from explain_graph import ExplainGraph
 
 _HISTORY_LIMIT = 50
 
@@ -321,6 +322,9 @@ class SqlEditor(Gtk.Box):
         self._explain_last_conn = None
         self._explain_is_analyze = False
         self._explain_json_cache = None
+        self._explain_fetching = False
+        self._explain_tree_rendered = False
+        self._explain_graph_rendered = False
         self._build_ui()
         self._load_file()
         self.connect('destroy', self._on_destroy)
@@ -516,40 +520,65 @@ class SqlEditor(Gtk.Box):
         self._explain_copy_confirm.set_visible(False)
         self._explain_copy_confirm_timer = 0
 
-        copy_text_btn = Gtk.Button(label='Copy Text')
-        copy_text_btn.add_css_class('flat')
-        copy_text_btn.set_icon_name('edit-copy-symbolic')
-        copy_text_btn.connect('clicked', self._on_explain_copy_text)
+        # Copy action group — items enabled contextually as views are rendered
+        _copy_ag = Gio.SimpleActionGroup()
+        self._explain_copy_text_action = Gio.SimpleAction.new('copy-text', None)
+        self._explain_copy_text_action.connect('activate', self._on_explain_copy_text)
+        self._explain_copy_text_action.set_enabled(False)
+        _copy_ag.add_action(self._explain_copy_text_action)
 
-        copy_json_btn = Gtk.Button(label='Copy JSON')
-        copy_json_btn.add_css_class('flat')
-        copy_json_btn.set_icon_name('edit-copy-symbolic')
-        copy_json_btn.connect('clicked', self._on_explain_copy_json)
+        self._explain_copy_markdown_action = Gio.SimpleAction.new('copy-markdown', None)
+        self._explain_copy_markdown_action.connect('activate', self._on_explain_copy_markdown)
+        self._explain_copy_markdown_action.set_enabled(False)
+        _copy_ag.add_action(self._explain_copy_markdown_action)
 
-        self._explain_tree_toggle = Gtk.ToggleButton(label='Tree')
-        self._explain_tree_toggle.add_css_class('flat')
-        self._explain_tree_toggle.set_icon_name('view-list-tree-symbolic')
-        self._explain_tree_toggle.connect('toggled', self._on_explain_tree_toggled)
+        self._explain_copy_json_action = Gio.SimpleAction.new('copy-json', None)
+        self._explain_copy_json_action.connect('activate', self._on_explain_copy_json)
+        self._explain_copy_json_action.set_enabled(False)
+        _copy_ag.add_action(self._explain_copy_json_action)
+
+        self._explain_copy_png_action = Gio.SimpleAction.new('copy-png', None)
+        self._explain_copy_png_action.connect('activate', self._on_explain_copy_png)
+        self._explain_copy_png_action.set_enabled(False)
+        _copy_ag.add_action(self._explain_copy_png_action)
+
+        self._explain_copy_svg_action = Gio.SimpleAction.new('copy-svg', None)
+        self._explain_copy_svg_action.connect('activate', self._on_explain_copy_svg)
+        self._explain_copy_svg_action.set_enabled(False)
+        _copy_ag.add_action(self._explain_copy_svg_action)
+
+        self.insert_action_group('explain-copy', _copy_ag)
+
+        _copy_menu = Gio.Menu()
+        _s1 = Gio.Menu()
+        _s1.append('Copy Text', 'explain-copy.copy-text')
+        _s1.append('Copy Markdown', 'explain-copy.copy-markdown')
+        _copy_menu.append_section(None, _s1)
+        _s2 = Gio.Menu()
+        _s2.append('Copy JSON', 'explain-copy.copy-json')
+        _copy_menu.append_section(None, _s2)
+        _s3 = Gio.Menu()
+        _s3.append('Copy PNG', 'explain-copy.copy-png')
+        _s3.append('Copy SVG', 'explain-copy.copy-svg')
+        _copy_menu.append_section(None, _s3)
+
+        _copy_content = Adw.ButtonContent()
+        _copy_content.set_icon_name('edit-copy-symbolic')
+        _copy_content.set_label('Copy')
+
+        self._explain_copy_btn = Adw.SplitButton()
+        self._explain_copy_btn.add_css_class('flat')
+        self._explain_copy_btn.set_child(_copy_content)
+        self._explain_copy_btn.set_menu_model(_copy_menu)
+        self._explain_copy_btn.set_action_name('explain-copy.copy-text')
 
         self._explain_analyze_warning = Gtk.Label()
         self._explain_analyze_warning.add_css_class('caption')
         self._explain_analyze_warning.add_css_class('warning')
         self._explain_analyze_warning.set_label('⚠ EXPLAIN ANALYZE executed the query')
         self._explain_analyze_warning.set_visible(False)
-        self._explain_analyze_warning.set_hexpand(True)
         self._explain_analyze_warning.set_xalign(0)
         self._explain_analyze_warning.set_margin_start(8)
-
-        explain_toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        explain_toolbar.set_margin_start(6)
-        explain_toolbar.set_margin_end(6)
-        explain_toolbar.set_margin_top(4)
-        explain_toolbar.set_margin_bottom(4)
-        explain_toolbar.append(copy_text_btn)
-        explain_toolbar.append(copy_json_btn)
-        explain_toolbar.append(self._explain_tree_toggle)
-        explain_toolbar.append(self._explain_analyze_warning)
-        explain_toolbar.append(self._explain_copy_confirm)
 
         self._explain_text_buf = Gtk.TextBuffer()
         self._explain_text_view = Gtk.TextView(buffer=self._explain_text_buf)
@@ -569,14 +598,45 @@ class SqlEditor(Gtk.Box):
         self._explain_tree_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self._explain_tree_scroll.set_vexpand(True)
 
-        self._explain_inner_stack = Gtk.Stack()
-        self._explain_inner_stack.add_named(explain_text_scroll, 'text')
-        self._explain_inner_stack.add_named(self._explain_tree_scroll, 'tree')
+        self._explain_graph = ExplainGraph()
+        self._explain_graph.set_vexpand(True)
+        self._explain_graph.set_hexpand(True)
+        self._explain_graph_scroll = Gtk.ScrolledWindow()
+        self._explain_graph_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self._explain_graph_scroll.set_vexpand(True)
+        self._explain_graph_scroll.set_child(self._explain_graph)
+
+        self._explain_view_stack = Adw.ViewStack()
+        self._explain_view_stack.add_titled_with_icon(
+            explain_text_scroll, 'text', 'Text', 'view-paged-symbolic')
+        self._explain_view_stack.add_titled_with_icon(
+            self._explain_tree_scroll, 'tree', 'Tree', 'view-list-tree-symbolic')
+        self._explain_view_stack.add_titled_with_icon(
+            self._explain_graph_scroll, 'graph', 'Graph', 'preferences-system-network-symbolic')
+        self._explain_view_stack.connect('notify::visible-child', self._on_explain_view_changed)
+
+        explain_view_switcher = Adw.ViewSwitcher()
+        explain_view_switcher.set_stack(self._explain_view_stack)
+        explain_view_switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+
+        explain_toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        explain_toolbar.set_margin_start(6)
+        explain_toolbar.set_margin_end(6)
+        explain_toolbar.set_margin_top(4)
+        explain_toolbar.set_margin_bottom(4)
+        _toolbar_spacer = Gtk.Box()
+        _toolbar_spacer.set_hexpand(True)
+
+        explain_toolbar.append(explain_view_switcher)
+        explain_toolbar.append(_toolbar_spacer)
+        explain_toolbar.append(self._explain_analyze_warning)
+        explain_toolbar.append(self._explain_copy_confirm)
+        explain_toolbar.append(self._explain_copy_btn)
 
         explain_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         explain_outer.append(explain_toolbar)
         explain_outer.append(Gtk.Separator())
-        explain_outer.append(self._explain_inner_stack)
+        explain_outer.append(self._explain_view_stack)
         self._results_stack.add_named(explain_outer, 'explain')
 
         # Tab view — "Results" is always the first (pinned) tab;
@@ -1270,7 +1330,14 @@ class SqlEditor(Gtk.Box):
         self._explain_last_conn = dict(self._connection)
         self._explain_is_analyze = (mode == 'analyze')
         self._explain_json_cache = None
-        self._explain_tree_toggle.set_active(False)
+        self._explain_fetching = False
+        self._explain_tree_rendered = False
+        self._explain_graph_rendered = False
+        self._explain_copy_text_action.set_enabled(False)
+        self._explain_copy_markdown_action.set_enabled(False)
+        self._explain_copy_json_action.set_enabled(False)
+        self._explain_copy_png_action.set_enabled(False)
+        self._explain_copy_svg_action.set_enabled(False)
         self._start_run(sql, explain_mode=mode)
 
     def _execute_explain(self, conn, sql, mode):
@@ -1308,7 +1375,10 @@ class SqlEditor(Gtk.Box):
         self._finish_run()
         self._explain_text_buf.set_text(plan_text)
         self._explain_analyze_warning.set_visible(is_analyze)
-        self._explain_inner_stack.set_visible_child_name('text')
+        self._explain_view_stack.set_visible_child_name('text')
+        self._explain_copy_btn.set_action_name('explain-copy.copy-text')
+        self._explain_copy_text_action.set_enabled(True)
+        self._explain_copy_json_action.set_enabled(True)
         self._results_stack.set_visible_child_name('explain')
         self._results_meta.set_label(f'{"EXPLAIN ANALYZE" if is_analyze else "EXPLAIN"} — {self._elapsed_ms()} ms')
         self._append_history(
@@ -1316,51 +1386,81 @@ class SqlEditor(Gtk.Box):
             self._elapsed_ms(),
         )
 
-    def _on_explain_copy_text(self, _btn):
+    def _on_explain_copy_text(self, _action, _param):
         start = self._explain_text_buf.get_start_iter()
         end = self._explain_text_buf.get_end_iter()
         text = self._explain_text_buf.get_text(start, end, False)
         Gdk.Display.get_default().get_clipboard().set(text)
         self._show_explain_copy_confirm('Copied')
 
-    def _on_explain_copy_json(self, _btn):
+    def _on_explain_copy_markdown(self, _action, _param):
+        if self._explain_json_cache is None:
+            return
+        plan = self._explain_json_cache[0].get('Plan', {})
+        lines = []
+        def _walk(node, depth):
+            indent = '  ' * depth
+            node_type = node.get('Node Type', '?')
+            cost = node.get('Total Cost', 0.0)
+            plan_rows = node.get('Plan Rows', '?')
+            parts = [f'cost={cost:.2f}', f'rows≈{plan_rows}']
+            actual_rows = node.get('Actual Rows')
+            actual_time = node.get('Actual Total Time')
+            if actual_rows is not None:
+                parts.append(f'actual={actual_rows}')
+            if actual_time is not None:
+                parts.append(f'{actual_time:.2f}ms')
+            relation = node.get('Relation Name', '')
+            title = f'{node_type} on {relation}' if relation else node_type
+            lines.append(f'{indent}- **{title}** ({", ".join(parts)})')
+            for child in node.get('Plans', []):
+                _walk(child, depth + 1)
+        _walk(plan, 0)
+        Gdk.Display.get_default().get_clipboard().set('\n'.join(lines))
+        self._show_explain_copy_confirm('Copied Markdown')
+
+    def _on_explain_copy_json(self, _action, _param):
         if self._explain_json_cache is not None:
             Gdk.Display.get_default().get_clipboard().set(
                 json.dumps(self._explain_json_cache, indent=2))
             self._show_explain_copy_confirm('Copied JSON')
             return
-        # Re-run with FORMAT JSON
-        conn = self._explain_last_conn
-        sql = self._explain_last_sql
-        is_analyze = self._explain_is_analyze
-        if not conn or not sql:
+        if self._explain_fetching:
             return
-        prefix = 'EXPLAIN (ANALYZE, FORMAT JSON)' if is_analyze else 'EXPLAIN (FORMAT JSON)'
+        def _copy_after_fetch():
+            if self._explain_json_cache is not None:
+                Gdk.Display.get_default().get_clipboard().set(
+                    json.dumps(self._explain_json_cache, indent=2))
+                self._show_explain_copy_confirm('Copied JSON')
+        self._fetch_explain_json(
+            on_error=lambda e: (
+                self._show_explain_copy_confirm(f'Error: {e}'),
+                False,
+            )[-1],
+            on_complete=_copy_after_fetch,
+        )
 
-        def run():
-            try:
-                import psycopg
-                from tunnel import open_tunnel
-                with open_tunnel(conn) as (host, port), psycopg.connect(
-                    host=host, port=port,
-                    dbname=conn['database'], user=conn['username'],
-                    password=conn['password'], connect_timeout=10,
-                ) as db:
-                    with db.cursor() as cur:
-                        cur.execute(f'{prefix} {sql}')
-                        rows = cur.fetchall()
-                        plan_json = rows[0][0] if rows else []
-                    db.rollback()
-                self._explain_json_cache = plan_json
-                text = json.dumps(plan_json, indent=2)
-                def _copy_and_confirm(t=text):
-                    Gdk.Display.get_default().get_clipboard().set(t)
-                    self._show_explain_copy_confirm('Copied JSON')
-                GLib.idle_add(_copy_and_confirm)
-            except Exception as e:
-                GLib.idle_add(self._show_explain_copy_confirm, f'Error: {e}')
+    def _on_explain_copy_png(self, _action, _param):
+        try:
+            png = self._explain_graph.render_to_png_bytes()
+            if not png:
+                return
+            provider = Gdk.ContentProvider.new_for_bytes('image/png', GLib.Bytes.new(png))
+            Gdk.Display.get_default().get_clipboard().set_content(provider)
+            self._show_explain_copy_confirm('Copied PNG')
+        except Exception as e:
+            self._show_explain_copy_confirm(f'PNG error: {e}')
 
-        threading.Thread(target=run, daemon=True).start()
+    def _on_explain_copy_svg(self, _action, _param):
+        try:
+            svg = self._explain_graph.render_to_svg_bytes()
+            if not svg:
+                return
+            provider = Gdk.ContentProvider.new_for_bytes('image/svg+xml', GLib.Bytes.new(svg))
+            Gdk.Display.get_default().get_clipboard().set_content(provider)
+            self._show_explain_copy_confirm('Copied SVG')
+        except Exception as e:
+            self._show_explain_copy_confirm(f'SVG error: {e}')
 
     def _show_explain_copy_confirm(self, msg):
         self._explain_copy_confirm.set_label(msg)
@@ -1375,23 +1475,16 @@ class SqlEditor(Gtk.Box):
         self._explain_copy_confirm_timer = 0
         return False
 
-    def _on_explain_tree_toggled(self, btn):
-        if not btn.get_active():
-            self._explain_inner_stack.set_visible_child_name('text')
-            return
-
-        if self._explain_json_cache is not None:
-            self._render_explain_tree(self._explain_json_cache)
-            return
-
-        conn = self._explain_last_conn
-        sql = self._explain_last_sql
+    def _fetch_explain_json(self, on_error, on_complete=None):
+        """Fetch EXPLAIN JSON in a background thread, calling callbacks on the main thread."""
+        conn       = self._explain_last_conn
+        sql        = self._explain_last_sql
         is_analyze = self._explain_is_analyze
         if not conn or not sql:
-            btn.set_active(False)
+            on_error('No plan to fetch')
             return
-
         prefix = 'EXPLAIN (ANALYZE, FORMAT JSON)' if is_analyze else 'EXPLAIN (FORMAT JSON)'
+        self._explain_fetching = True
 
         def run():
             try:
@@ -1408,14 +1501,71 @@ class SqlEditor(Gtk.Box):
                         plan_json = rows[0][0] if rows else []
                     db.rollback()
                 self._explain_json_cache = plan_json
-                GLib.idle_add(self._render_explain_tree, plan_json)
+                self._explain_fetching = False
+                GLib.idle_add(self._refresh_current_explain_view)
+                if on_complete:
+                    GLib.idle_add(on_complete)
             except Exception as e:
-                GLib.idle_add(self._explain_tree_toggle.set_active, False)
-                GLib.idle_add(self._show_explain_copy_confirm, f'Tree error: {e}')
+                self._explain_fetching = False
+                GLib.idle_add(on_error, str(e))
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _refresh_current_explain_view(self):
+        """After a fetch completes, render the currently visible tab if it still needs it."""
+        page = self._explain_view_stack.get_visible_child_name()
+        if page == 'tree' and not self._explain_tree_rendered and self._explain_json_cache:
+            self._render_explain_tree(self._explain_json_cache)
+        elif page == 'graph' and not self._explain_graph_rendered and self._explain_json_cache:
+            self._render_explain_graph(self._explain_json_cache)
+
+    def _on_explain_view_changed(self, stack, _pspec):
+        page_name = stack.get_visible_child_name()
+        self._explain_copy_btn.set_action_name({
+            'text':  'explain-copy.copy-text',
+            'tree':  'explain-copy.copy-markdown',
+            'graph': 'explain-copy.copy-png',
+        }.get(page_name, 'explain-copy.copy-text'))
+        if page_name == 'text':
+            return
+
+        if page_name == 'tree':
+            if self._explain_json_cache is not None:
+                self._render_explain_tree(self._explain_json_cache)
+                return
+            if not self._explain_last_conn or not self._explain_last_sql:
+                stack.set_visible_child_name('text')
+                return
+            if self._explain_fetching:
+                return
+            self._fetch_explain_json(
+                on_error=lambda e: (
+                    stack.set_visible_child_name('text'),
+                    self._show_explain_copy_confirm(f'Tree error: {e}'),
+                    False,
+                )[-1],
+            )
+
+        elif page_name == 'graph':
+            if self._explain_json_cache is not None:
+                self._render_explain_graph(self._explain_json_cache)
+                return
+            if not self._explain_last_conn or not self._explain_last_sql:
+                stack.set_visible_child_name('text')
+                return
+            if self._explain_fetching:
+                return
+            self._fetch_explain_json(
+                on_error=lambda e: (
+                    stack.set_visible_child_name('text'),
+                    self._show_explain_copy_confirm(f'Graph error: {e}'),
+                    False,
+                )[-1],
+            )
+
     def _render_explain_tree(self, plan_json):
+        if self._explain_tree_rendered:
+            return
         # plan_json is a list; first element has a "Plan" key
         if not plan_json or not isinstance(plan_json, list):
             return
@@ -1467,7 +1617,16 @@ class SqlEditor(Gtk.Box):
         page.add(group)
 
         self._explain_tree_scroll.set_child(page)
-        self._explain_inner_stack.set_visible_child_name('tree')
+        self._explain_tree_rendered = True
+        self._explain_copy_markdown_action.set_enabled(True)
+
+    def _render_explain_graph(self, plan_json):
+        if self._explain_graph_rendered:
+            return
+        self._explain_graph.set_plan(plan_json)
+        self._explain_graph_rendered = True
+        self._explain_copy_png_action.set_enabled(True)
+        self._explain_copy_svg_action.set_enabled(True)
 
     # ── History ───────────────────────────────────────────────────────────────
 

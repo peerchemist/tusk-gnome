@@ -1,6 +1,9 @@
+import re
 import threading
 import uuid
 from urllib.parse import urlparse, unquote, quote
+
+from aws_discovery import is_aurora_writer_endpoint, aurora_reader_from_writer
 
 import gi
 import keyring
@@ -18,17 +21,20 @@ class ConnectionDialog(Adw.Dialog):
         'connection-saved': (GObject.SignalFlags.RUN_FIRST, None, (GObject.TYPE_PYOBJECT,))
     }
 
-    def __init__(self, parent, connection=None, duplicate=False):
+    def __init__(self, parent, connection=None, duplicate=False, store=None):
         if duplicate:
             title = 'Duplicate Connection'
         elif connection is None:
             title = 'New Connection'
         else:
             title = 'Edit Connection'
-        super().__init__(title=title, content_width=820)
+        super().__init__(title=title, content_width=900)
+        self.add_css_class('tusk-main')
         self._connection = connection
         self._duplicate = duplicate
         self._parent = parent
+        self._store = store
+        self._selected_tags = set(connection.get('tags', []) if connection else [])
         self._build_ui()
         if duplicate:
             self.connect('map', lambda _: self._name_row.grab_focus())
@@ -85,8 +91,20 @@ class ConnectionDialog(Adw.Dialog):
 
         self._uri_preview_row.set_title('Connection String')
 
+        # Aurora reader endpoint — shown when writer hostname is detected
+        self._aurora_reader_row = Adw.EntryRow(title='Aurora Reader Endpoint')
+        self._aurora_reader_row.set_tooltip_text(
+            'Optional. Reader endpoint for this Aurora cluster — load-balanced across replicas. '
+            'Tusk will add a writer/reader toggle to the connection sidebar.'
+        )
+        self._aurora_reader_row.set_visible(False)
+        self._reader_autofilled = False
+        self._setting_reader_programmatically = False
+        self._aurora_reader_row.connect('notify::text', self._on_reader_text_changed)
+
         details_group.add(self._host_row)
         details_group.add(self._port_row)
+        details_group.add(self._aurora_reader_row)
         details_group.add(self._database_row)
         details_group.add(self._uri_preview_row)
 
@@ -150,6 +168,31 @@ class ConnectionDialog(Adw.Dialog):
 
         ssh_group.add(self._ssh_row)
 
+        # ── Cloud SQL Auth Proxy ──────────────────────────────────────────────
+        cloud_group = Adw.PreferencesGroup(title='Cloud SQL Auth Proxy')
+
+        self._proxy_row = Adw.ExpanderRow(title='Use Cloud SQL Auth Proxy')
+        self._proxy_row.set_show_enable_switch(True)
+        self._proxy_row.set_subtitle(
+            'Route connections through cloud-sql-proxy. Requires the '
+            'cloud-sql-proxy binary on your PATH.'
+        )
+
+        self._proxy_instance_row = Adw.EntryRow(title='Instance ID')
+        self._proxy_instance_row.set_tooltip_text(
+            'Cloud SQL instance connection name — found in the Google Cloud console.\n'
+            'Format: project-id:region:instance-name'
+        )
+
+        self._proxy_auth_row = Adw.ComboRow(title='Authentication')
+        self._proxy_auth_row.set_subtitle('How Tusk authenticates with the database')
+        auth_model = Gtk.StringList.new(['Password', 'IAM (Google Identity)'])
+        self._proxy_auth_row.set_model(auth_model)
+
+        self._proxy_row.add_row(self._proxy_instance_row)
+        self._proxy_row.add_row(self._proxy_auth_row)
+        cloud_group.add(self._proxy_row)
+
         # ── Populate values ───────────────────────────────────────────────────
         if conn and self._duplicate:
             self._name_row.set_text(conn['name'] + ' copy')
@@ -187,27 +230,95 @@ class ConnectionDialog(Adw.Dialog):
         self._ssh_passphrase_row.set_text(ssh_passphrase)
         self._default_schema_row.set_text(conn.get('default_schema', '') if conn else '')
 
+        proxy_enabled = conn.get('cloud_proxy_enabled', False) if conn else False
+        self._proxy_row.set_enable_expansion(proxy_enabled)
+        self._proxy_row.set_expanded(proxy_enabled)
+        self._proxy_instance_row.set_text((conn.get('cloud_instance_id') or '') if conn else '')
+        self._proxy_auth_row.set_selected(
+            1 if (conn.get('cloud_auth_mode') == 'iam' if conn else False) else 0
+        )
+        self._pre_proxy_host = None
+        if proxy_enabled:
+            self._pre_proxy_host = self._host_row.get_text()
+            self._host_row.set_text('localhost')
+            self._host_row.set_sensitive(False)
+        self._proxy_row.connect('notify::enable-expansion', self._on_proxy_toggled)
+        self._proxy_auth_row.connect('notify::selected', self._on_proxy_auth_changed)
+        self._on_proxy_auth_changed()  # apply initial state
+
         self._keyring_banner = Adw.Banner(
             title="Passwords can't be saved — the system password manager isn't available. Try logging out and back in."
         )
         self._keyring_banner.set_revealed(keyring_failed)
 
+        # Populate Aurora reader endpoint from existing profile
+        existing_reader = conn.get('secondary_endpoint', '') if conn else ''
+        if existing_reader:
+            self._aurora_reader_row.set_text(existing_reader)
+            self._aurora_reader_row.set_visible(True)
+
         # Connect live preview signals
         for row in (self._host_row, self._port_row, self._database_row, self._username_row):
             row.connect('notify::text', self._update_uri_preview)
+        self._host_row.connect('notify::text', self._on_host_changed)
         self._update_uri_preview()
+        self._on_host_changed()  # run once to show reader row on edit if already Aurora
 
         # ── 2-column layout ───────────────────────────────────────────────────
         left_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         left_col.set_hexpand(True)
-        left_col.append(name_group)
         left_col.append(details_group)
         left_col.append(auth_group)
+
+        # ── Tags ─────────────────────────────────────────────────────────────
+        self._tag_checks = {}  # name → Gtk.CheckButton
+        self._tags_registry = self._store.get_tags_registry() if self._store else {}
+        self._tags_expander = None
+        self._tags_summary_label = None
+        registry = self._tags_registry
+        tags_group = None
+        if registry:
+            tags_group = Adw.PreferencesGroup()
+            self._tags_expander = Adw.ExpanderRow(title='Tags')
+            self._tags_summary_label = Gtk.Label()
+            self._tags_summary_label.set_valign(Gtk.Align.CENTER)
+            self._tags_summary_label.add_css_class('dim-label')
+            self._tags_expander.add_suffix(self._tags_summary_label)
+            tags_group.add(self._tags_expander)
+            for tag_name in sorted(registry):
+                meta = registry[tag_name]
+                row = Adw.ActionRow(title=tag_name)
+                # Colored swatch prefix
+                swatch = Gtk.Label()
+                swatch.set_valign(Gtk.Align.CENTER)
+                raw_color = meta.get('color', '#aaaaaa')
+                color = raw_color if re.match(r'^#[0-9a-fA-F]{6}$', raw_color or '') else '#aaaaaa'
+                swatch.set_markup(f'<span foreground="{color}">⬤</span>')
+                row.add_prefix(swatch)
+                if meta.get('warn_on_connect'):
+                    warn = Gtk.Label(label='⚠')
+                    warn.set_valign(Gtk.Align.CENTER)
+                    warn.set_tooltip_text('Warn on connect')
+                    warn.add_css_class('warning')
+                    row.add_suffix(warn)
+                check = Gtk.CheckButton()
+                check.set_active(tag_name in self._selected_tags)
+                check.set_valign(Gtk.Align.CENTER)
+                check.connect('toggled', self._on_tag_toggled, tag_name)
+                row.add_suffix(check)
+                row.set_activatable_widget(check)
+                self._tags_expander.add_row(row)
+                self._tag_checks[tag_name] = check
+            # Collapse by default when there are more than 4 tags
+            self._tags_expander.set_expanded(len(registry) <= 4)
+            self._tags_expander.connect('notify::expanded', self._on_tags_expander_changed)
+            self._update_tags_subtitle()
 
         right_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         right_col.set_hexpand(True)
         right_col.append(options_group)
-        right_col.append(ssh_group)
+        if tags_group:
+            right_col.append(tags_group)
 
         two_col = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
         two_col.append(left_col)
@@ -221,7 +332,10 @@ class ConnectionDialog(Adw.Dialog):
 
         content.append(uri_group)
         content.append(self._uri_error_label)
+        content.append(name_group)
         content.append(two_col)
+        content.append(ssh_group)
+        content.append(cloud_group)
         content.append(self._keyring_banner)
 
         # ── Test / Save ───────────────────────────────────────────────────────
@@ -265,6 +379,80 @@ class ConnectionDialog(Adw.Dialog):
         self._toast_overlay = Adw.ToastOverlay()
         self._toast_overlay.set_child(toolbar_view)
         self.set_child(self._toast_overlay)
+
+    def _on_host_changed(self, *_):
+        host = self._host_row.get_text().strip()
+        if is_aurora_writer_endpoint(host):
+            self._aurora_reader_row.set_visible(True)
+            # Auto-populate reader endpoint only if the field is currently empty
+            if not self._aurora_reader_row.get_text().strip():
+                reader = aurora_reader_from_writer(host)
+                if reader:
+                    self._setting_reader_programmatically = True
+                    self._aurora_reader_row.set_text(reader)
+                    self._setting_reader_programmatically = False
+                    self._reader_autofilled = True
+        else:
+            if self._reader_autofilled:
+                # Clear the auto-filled value — it belongs to a different host
+                self._reader_autofilled = False
+                self._setting_reader_programmatically = True
+                self._aurora_reader_row.set_text('')
+                self._setting_reader_programmatically = False
+                self._aurora_reader_row.set_visible(False)
+            elif not self._aurora_reader_row.get_text().strip():
+                self._aurora_reader_row.set_visible(False)
+
+    def _on_proxy_toggled(self, *_):
+        enabled = self._proxy_row.get_enable_expansion()
+        if enabled:
+            self._pre_proxy_host = self._host_row.get_text()
+            self._host_row.set_text('localhost')
+            self._host_row.set_sensitive(False)
+        else:
+            self._host_row.set_sensitive(True)
+            if self._pre_proxy_host is not None:
+                self._host_row.set_text(self._pre_proxy_host)
+                self._pre_proxy_host = None
+
+    def _on_proxy_auth_changed(self, *_):
+        iam = self._proxy_auth_row.get_selected() == 1
+        self._password_row.set_sensitive(not iam)
+
+    def _on_reader_text_changed(self, *_):
+        # If the user edits the reader field directly, it's no longer auto-filled
+        if not self._setting_reader_programmatically:
+            self._reader_autofilled = False
+
+    def _on_tag_toggled(self, check, tag_name):
+        if check.get_active():
+            self._selected_tags.add(tag_name)
+        else:
+            self._selected_tags.discard(tag_name)
+        self._update_tags_subtitle()
+
+    def _on_tags_expander_changed(self, *_):
+        if self._tags_expander.get_expanded():
+            self._tags_summary_label.set_visible(False)
+        else:
+            self._update_tags_subtitle()
+
+    def _update_tags_subtitle(self):
+        if self._tags_expander is None or self._tags_expander.get_expanded():
+            return
+        selected_sorted = [t for t in sorted(self._tags_registry) if t in self._selected_tags]
+        if not selected_sorted:
+            self._tags_summary_label.set_markup('None')
+        else:
+            parts = []
+            for tag_name in selected_sorted:
+                meta = self._tags_registry.get(tag_name, {})
+                raw_color = meta.get('color', '#aaaaaa')
+                color = raw_color if re.match(r'^#[0-9a-fA-F]{6}$', raw_color or '') else '#aaaaaa'
+                escaped = GLib.markup_escape_text(tag_name)
+                parts.append(f'<span foreground="{color}">⬤</span> {escaped}')
+            self._tags_summary_label.set_markup(', '.join(parts))
+        self._tags_summary_label.set_visible(True)
 
     def _on_browse_key(self, _btn):
         dialog = Gtk.FileChooserNative(
@@ -357,6 +545,20 @@ class ConnectionDialog(Adw.Dialog):
             'ssh_key_path': self._ssh_key_row.get_text().strip(),
             'ssh_passphrase': self._ssh_passphrase_row.get_text(),
         }
+        proxy_enabled = self._proxy_row.get_enable_expansion()
+        is_cloud = proxy_enabled or bool(
+            self._connection and self._connection.get('cloud_provider')
+        )
+        if is_cloud:
+            params.update({
+                'cloud_proxy_enabled': proxy_enabled,
+                'cloud_instance_id': self._proxy_instance_row.get_text().strip(),
+                'cloud_auth_mode': 'iam' if self._proxy_auth_row.get_selected() == 1 else 'password',
+                'cloud_provider': (
+                    self._connection.get('cloud_provider', 'gcp-cloudsql')
+                    if self._connection else 'gcp-cloudsql'
+                ),
+            })
         default_schema = self._default_schema_row.get_text().strip()
         if default_schema:
             params['default_schema'] = default_schema
@@ -375,19 +577,9 @@ class ConnectionDialog(Adw.Dialog):
 
     def _run_test(self, params):
         try:
-            import psycopg
-            from tunnel import open_tunnel
-
-            with open_tunnel(params) as (host, port):
-                with psycopg.connect(
-                    host=host,
-                    port=port,
-                    dbname=params['database'],
-                    user=params['username'],
-                    password=params['password'],
-                    connect_timeout=10,
-                ):
-                    pass
+            from tunnel import open_db
+            with open_db(params):
+                pass
             GLib.idle_add(self._on_test_result, True, None)
         except Exception as e:
             GLib.idle_add(self._on_test_result, False, str(e))
@@ -410,6 +602,8 @@ class ConnectionDialog(Adw.Dialog):
         host = self._host_row.get_text().strip()
         username = self._username_row.get_text().strip()
 
+        proxy_instance = self._proxy_instance_row.get_text().strip()
+
         valid = True
         for row, value in (
             (self._name_row, name),
@@ -421,6 +615,12 @@ class ConnectionDialog(Adw.Dialog):
             else:
                 row.add_css_class('error')
                 valid = False
+
+        if self._proxy_row.get_enable_expansion() and not proxy_instance:
+            self._proxy_instance_row.add_css_class('error')
+            valid = False
+        else:
+            self._proxy_instance_row.remove_css_class('error')
 
         if not valid:
             return
@@ -434,6 +634,7 @@ class ConnectionDialog(Adw.Dialog):
         except ValueError:
             ssh_port = 22
 
+        proxy_enabled = self._proxy_row.get_enable_expansion()
         conn = {
             'id': str(uuid.uuid4()) if self._duplicate else (
                 self._connection['id'] if self._connection else str(uuid.uuid4())
@@ -451,9 +652,30 @@ class ConnectionDialog(Adw.Dialog):
             'ssh_user': self._ssh_user_row.get_text().strip(),
             'ssh_key_path': self._ssh_key_row.get_text().strip(),
             'ssh_passphrase': self._ssh_passphrase_row.get_text(),
+            'tags': sorted(self._selected_tags),
         }
+        is_cloud = proxy_enabled or bool(
+            self._connection and self._connection.get('cloud_provider')
+        )
+        if is_cloud:
+            conn.update({
+                'cloud_proxy_enabled': proxy_enabled,
+                'cloud_instance_id': self._proxy_instance_row.get_text().strip(),
+                'cloud_auth_mode': 'iam' if self._proxy_auth_row.get_selected() == 1 else 'password',
+                'cloud_provider': (
+                    self._connection.get('cloud_provider', 'gcp-cloudsql')
+                    if self._connection else 'gcp-cloudsql'
+                ),
+            })
         default_schema = self._default_schema_row.get_text().strip()
         if default_schema:
             conn['default_schema'] = default_schema
+        reader = self._aurora_reader_row.get_text().strip()
+        if reader:
+            conn['secondary_endpoint'] = reader
+            conn['secondary_port'] = port
+        else:
+            conn['secondary_endpoint'] = None
+            conn['secondary_port'] = None
         self.emit('connection-saved', conn)
         self.close()

@@ -19,17 +19,24 @@ COL_SENSITIVE = 4
 
 class FileExplorer(Gtk.Box):
     __gsignals__ = {
-        'file-activated': (GObject.SignalFlags.RUN_FIRST, None, (str,)),
-        'file-deleted':   (GObject.SignalFlags.RUN_FIRST, None, (str,)),
-        'file-renamed':   (GObject.SignalFlags.RUN_FIRST, None, (str, str)),
+        'file-activated':    (GObject.SignalFlags.RUN_FIRST, None, (str,)),
+        'file-deleted':      (GObject.SignalFlags.RUN_FIRST, None, (str,)),
+        'file-renamed':      (GObject.SignalFlags.RUN_FIRST, None, (str, str)),
+        'collapsed-changed': (GObject.SignalFlags.RUN_FIRST, None, (bool,)),
     }
 
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         start = prefs.get('last_folder', os.path.expanduser('~'))
         self._current_dir = start if os.path.isdir(start) else os.path.expanduser('~')
+        self._collapsed = False
         self._build_ui()
         self._refresh()
+        if prefs.get('file_explorer_collapsed', False):
+            self._collapsed = True
+            self._collapsible.set_visible(False)
+            self._collapse_btn.set_icon_name('pan-up-symbolic')
+            self._collapse_btn.set_tooltip_text('Expand file explorer')
 
     @property
     def current_dir(self):
@@ -43,11 +50,6 @@ class FileExplorer(Gtk.Box):
         nav.set_margin_top(MARGIN_XS)
         nav.set_margin_bottom(MARGIN_XS)
 
-        self._up_btn = Gtk.Button(icon_name='go-up-symbolic')
-        self._up_btn.add_css_class('flat')
-        self._up_btn.set_tooltip_text('Go up')
-        self._up_btn.connect('clicked', self._on_go_up)
-
         home_btn = Gtk.Button(icon_name='go-home-symbolic')
         home_btn.add_css_class('flat')
         home_btn.set_tooltip_text('Home directory')
@@ -59,6 +61,11 @@ class FileExplorer(Gtk.Box):
         self._path_label.set_ellipsize(3)
         self._path_label.add_css_class('caption')
         self._path_label.add_css_class('dim-label')
+        self._path_label.set_tooltip_text('Click to copy path')
+        self._path_label.set_cursor(Gdk.Cursor.new_from_name('pointer'))
+        _click = Gtk.GestureClick()
+        _click.connect('released', self._on_path_clicked)
+        self._path_label.add_controller(_click)
 
         new_folder_btn = Gtk.Button(icon_name='folder-new-symbolic')
         new_folder_btn.add_css_class('flat')
@@ -70,14 +77,25 @@ class FileExplorer(Gtk.Box):
         new_file_btn.set_tooltip_text('New SQL file')
         new_file_btn.connect('clicked', lambda _: self._prompt_create('file'))
 
-        nav.append(self._up_btn)
+        self._collapse_btn = Gtk.Button(icon_name='pan-down-symbolic')
+        self._collapse_btn.add_css_class('flat')
+        self._collapse_btn.set_tooltip_text('Collapse file explorer')
+        self._collapse_btn.connect('clicked', lambda _: self._toggle_collapsed())
+
         nav.append(home_btn)
         nav.append(self._path_label)
         nav.append(new_folder_btn)
         nav.append(new_file_btn)
+        nav.append(self._collapse_btn)
 
         self.append(nav)
-        self.append(Gtk.Separator())
+
+        # ── Collapsible content ───────────────────────────────────────────────
+        self._collapsible = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        self._collapsible.append(Gtk.Separator())
+
+        self.append(self._collapsible)
 
         # ── File tree ─────────────────────────────────────────────────────────
         self._store = Gtk.ListStore(str, str, str, GObject.TYPE_BOOLEAN, GObject.TYPE_BOOLEAN)
@@ -121,7 +139,7 @@ class FileExplorer(Gtk.Box):
         self._list_stack.set_vexpand(True)
         self._list_stack.add_named(scroll, 'list')
         self._list_stack.add_named(self._error_status, 'error')
-        self.append(self._list_stack)
+        self._collapsible.append(self._list_stack)
 
         # ── Context menu ──────────────────────────────────────────────────────
         self._ctx_path = None
@@ -152,6 +170,18 @@ class FileExplorer(Gtk.Box):
         right_click.connect('pressed', self._on_right_click)
         self._tree.add_controller(right_click)
 
+    def _toggle_collapsed(self):
+        self._collapsed = not self._collapsed
+        prefs.put('file_explorer_collapsed', self._collapsed)
+        self._collapsible.set_visible(not self._collapsed)
+        if self._collapsed:
+            self._collapse_btn.set_icon_name('pan-up-symbolic')
+            self._collapse_btn.set_tooltip_text('Expand file explorer')
+        else:
+            self._collapse_btn.set_icon_name('pan-down-symbolic')
+            self._collapse_btn.set_tooltip_text('Collapse file explorer')
+        self.emit('collapsed-changed', self._collapsed)
+
     def _can_select(self, _sel, model, path, _current):
         it = model.get_iter(path)
         return model.get_value(it, COL_SENSITIVE)
@@ -160,7 +190,6 @@ class FileExplorer(Gtk.Box):
         self._store.clear()
         self._list_stack.set_visible_child_name('list')
         self._path_label.set_label(self._current_dir)
-        self._up_btn.set_sensitive(os.path.dirname(self._current_dir) != self._current_dir)
 
         parent = os.path.dirname(self._current_dir)
         if parent != self._current_dir:
@@ -183,6 +212,12 @@ class FileExplorer(Gtk.Box):
         except OSError as e:
             self._error_status.set_description('Permission denied' if isinstance(e, PermissionError) else str(e))
             self._list_stack.set_visible_child_name('error')
+
+    def _on_path_clicked(self, _gesture, _n, _x, _y):
+        Gdk.Display.get_default().get_clipboard().set(self._current_dir)
+        root = self.get_root()
+        if hasattr(root, 'show_toast'):
+            root.show_toast('Path copied')
 
     def _navigate_to(self, path):
         self._current_dir = path
